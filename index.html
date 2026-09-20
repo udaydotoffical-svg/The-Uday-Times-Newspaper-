@@ -48,6 +48,10 @@
   }
   textarea{min-height:76px;resize:vertical}
   input[type=range]{width:100%}
+  select{
+    width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:7px;
+    background:var(--bg);color:var(--ink);font:inherit;min-height:44px;
+  }
   .row{display:flex;gap:8px;flex-wrap:wrap}
   .row>*{flex:1 1 auto}
   button{
@@ -96,7 +100,20 @@
   </div>
   <p class="hint"><span class="dot" id="dot"></span><span id="conn">Not connected</span></p>
   <label>Intensity — <span class="kv" id="intVal">0x5D</span> (higher is darker)</label>
-  <input type="range" id="intensity" min="20" max="180" value="93">
+  <input type="range" id="intensity" min="20" max="200" value="140">
+
+  <label>Boldness — <span class="kv" id="thrVal">176</span>
+    (higher fattens antialiased text)</label>
+  <input type="range" id="threshold" min="100" max="230" value="176">
+
+  <label style="display:flex;gap:8px;align-items:center;margin-top:12px">
+    <input type="checkbox" id="shortFeed" checked style="width:auto">
+    <span>Short feed after print (mode 0x01)</span>
+  </label>
+  <label style="display:flex;gap:8px;align-items:center;margin-top:8px">
+    <input type="checkbox" id="flip" style="width:auto">
+    <span>Flip 180&deg; — tick if the print comes out upside down</span>
+  </label>
 </div>
 
 <div class="card">
@@ -110,6 +127,32 @@
 
 <div class="card">
   <h2>Tech news</h2>
+
+  <div class="row" style="align-items:flex-end">
+    <div style="flex:2 1 140px">
+      <label>Hacker News</label>
+      <select id="hnSource">
+        <option value="front_page">Front page</option>
+        <option value="top24">Top, last 24h</option>
+        <option value="new">Newest stories</option>
+      </select>
+    </div>
+    <div style="flex:1 1 80px">
+      <label>How many</label>
+      <select id="hnCount">
+        <option>3</option><option selected>5</option>
+        <option>8</option><option>10</option>
+      </select>
+    </div>
+  </div>
+  <label>Only headlines containing (optional, comma separated)</label>
+  <input type="text" id="hnFilter" placeholder="esp32, linux, ai">
+  <div class="row" style="margin-top:8px">
+    <button id="btnFetch">Fetch headlines</button>
+    <button id="btnAppend">Fetch &amp; append</button>
+  </div>
+  <p class="hint" id="hnStatus">Pulls from the Hacker News API. Needs internet.</p>
+
   <label>One headline per line</label>
   <textarea id="news" placeholder="ESP32-S3 gains native USB host support&#10;Debian 14 freeze begins"></textarea>
   <label>Footer note (optional)</label>
@@ -131,8 +174,8 @@
 <div class="card">
   <h2>Status payload</h2>
   <p class="hint">Implementations disagree about these offsets by six bytes.
-     Whichever row shows a sane battery percentage and a room-ish
-     temperature is correct for your firmware.</p>
+     Confirmed on real hardware: <strong>FRAME</strong> is the correct
+     row. The documented PAYLOAD offsets are off by the six-byte header.</p>
   <table id="offsets"><tbody>
     <tr><th>Reading</th><th>state</th><th>batt</th><th>temp</th><th>flag</th></tr>
     <tr><td>PAYLOAD</td><td colspan="4">—</td></tr>
@@ -276,11 +319,18 @@ function encodeRows(rows){
   return padded;
 }
 
+let PRINT_MODE = 0x01;   // 0x00 = reference mode, ejects a long trailer
+let ROTATE180  = false;  // see the Flip toggle; off = masthead upright
+
 async function printRows(rows, intensity){
   const height = rows.length;
   // 180 degree rotation: reverse row order, and each row's pixels.
-  const rotated = rows.slice().reverse().map(r => r.slice().reverse());
-  const buffer  = encodeRows(rotated);
+  // The reference site always rotates; whether that reads right-side-up
+  // depends on your printer, so it is a toggle here.
+  const oriented = ROTATE180
+    ? rows.slice().reverse().map(r => r.slice().reverse())
+    : rows;
+  const buffer = encodeRows(oriented);
 
   log(`printing ${height} rows (${(height/DOTS_PER_MM/10).toFixed(1)} cm), ${buffer.length} bytes`);
 
@@ -294,9 +344,11 @@ async function printRows(rows, intensity){
     throw new Error("printer error code " + (st.length>13 ? st[13] : "?"));
   }
 
-  // 3) print request: lines LE, 0x30, mode 0 = 1bpp
+  // 3) print request: lines LE, 0x30, mode.
+  //    0x00 = 1bpp, but the printer then ejects a long blank trailer.
+  //    0x01 is the same monochrome output with far less post-print eject.
   await sendControl(CMD.PRINT,
-    Uint8Array.of(height & 0xFF, (height>>8)&0xFF, 0x30, 0x00));
+    Uint8Array.of(height & 0xFF, (height>>8)&0xFF, 0x30, PRINT_MODE));
   const ack = await waitFor(CMD.PRINT, 5000);
   if (!ack || ack[0] !== 0) throw new Error("print request rejected");
 
@@ -430,6 +482,8 @@ function measure(tasks, news, note){
 }
 
 // Canvas -> rows of booleans, thresholding luminance at 128 (as the reference does).
+let THRESHOLD = 176;   // 128 loses antialiased edges and prints skeletal
+
 function canvasRows(){
   const img = ctx.getImageData(0,0,WIDTH,cv.height).data;
   const rows = [];
@@ -438,138 +492,65 @@ function canvasRows(){
     for (let x=0; x<WIDTH; x++){
       const i = (y*WIDTH + x)*4;
       const lum = 0.299*img[i] + 0.587*img[i+1] + 0.114*img[i+2];
-      row[x] = lum < 128;
+      row[x] = lum < THRESHOLD;
     }
     rows.push(row);
   }
   return rows;
 }
 
-/* ===================== UI ===================== */
+/* ===================== Hacker News ===================== */
 
-const $ = id => document.getElementById(id);
-function log(m){
-  const el = $("log");
-  el.textContent += "\n" + m;
-  el.scrollTop = el.scrollHeight;
-}
-function hex(a){ return [...a].map(b=>b.toString(16).padStart(2,"0")).join(" "); }
-function setConn(ok, msg){
-  $("dot").className = "dot" + (ok ? " on" : msg ? " err" : "");
-  $("conn").textContent = msg;
-  for (const id of ["btnStatus","btnPrint","btnFeed"]) $(id).disabled = !ok;
-}
-function setBtn(t){ $("btnPrint").textContent = t; }
+// Algolia's Hacker News API: no key, CORS enabled, JSON (much lighter to
+// parse than RSS, and RSS mirrors usually block cross-origin requests).
+const HN_API = "https://hn.algolia.com/api/v1/";
 
-function addTask(text="", done=false){
-  const d = document.createElement("div");
-  d.className = "task";
-  const c = document.createElement("input"); c.type="checkbox"; c.checked=done;
-  const i = document.createElement("input"); i.type="text"; i.value=text;
-  i.placeholder="Something to do";
-  const b = document.createElement("button"); b.textContent="×"; b.title="Remove";
-  b.onclick = ()=>{ d.remove(); save(); renderPage(); };
-  for (const el of [c,i]) el.addEventListener("input", ()=>{ save(); renderPage(); });
-  d.append(c,i,b); $("tasks").appendChild(d);
-  return i;
-}
-
-function save(){
-  try{
-    const tasks = [...document.querySelectorAll(".task")].map(t=>({
-      text:t.querySelector("input[type=text]").value,
-      done:t.querySelector("input[type=checkbox]").checked }));
-    localStorage.setItem("udayTimes", JSON.stringify({
-      tasks, news:$("news").value, note:$("note").value,
-      intensity:$("intensity").value }));
-  }catch(e){}
-}
-
-function load(){
-  let d = null;
-  try{ d = JSON.parse(localStorage.getItem("udayTimes") || "null"); }catch(e){}
-  if (d){
-    (d.tasks||[]).forEach(t=>addTask(t.text, t.done));
-    $("news").value = d.news || "";
-    $("note").value = d.note || "";
-    if (d.intensity) $("intensity").value = d.intensity;
+function hnUrl(source, count){
+  // Over-fetch so keyword filtering still leaves enough headlines.
+  const n = Math.min(count * 6, 50);
+  if (source === "front_page")
+    return `${HN_API}search?tags=front_page&hitsPerPage=${n}`;
+  if (source === "top24"){
+    const since = Math.floor(Date.now()/1000) - 86400;
+    return `${HN_API}search?tags=story&numericFilters=created_at_i>${since}` +
+           `&hitsPerPage=${n}`;
   }
-  if (!document.querySelector(".task")) addTask();
+  return `${HN_API}search_by_date?tags=story&hitsPerPage=${n}`;
 }
 
-function showOffsets(p){
-  const rows = $("offsets").tBodies[0].rows;
-  const at = i => p.length > i ? p[i] : "–";
-  rows[1].innerHTML = `<td>PAYLOAD</td><td>${at(6)}</td><td>${at(9)}</td>` +
-                      `<td>${at(10)}</td><td>${at(12)}</td>`;
-  rows[2].innerHTML = `<td>FRAME</td><td>${at(0)}</td><td>${at(3)}</td>` +
-                      `<td>${at(4)}</td><td>${at(6)}</td>`;
+async function fetchHN(){
+  const source = $("hnSource").value;
+  const count  = parseInt($("hnCount").value, 10);
+  const terms  = $("hnFilter").value.toLowerCase()
+                   .split(",").map(s=>s.trim()).filter(Boolean);
+
+  $("hnStatus").textContent = "Fetching…";
+  const res = await fetch(hnUrl(source, count));
+  if (!res.ok) throw new Error("Hacker News API returned " + res.status);
+  const data = await res.json();
+
+  let hits = (data.hits || []).filter(h => h.title);
+  if (terms.length){
+    hits = hits.filter(h => terms.some(t => h.title.toLowerCase().includes(t)));
+  }
+  // Drop duplicates, keep order.
+  const seen = new Set();
+  hits = hits.filter(h => !seen.has(h.title) && seen.add(h.title));
+
+  const titles = hits.slice(0, count).map(h => h.title.replace(/\s+/g, " ").trim());
+  $("hnStatus").textContent = titles.length
+    ? `${titles.length} headline${titles.length===1?"":"s"} from ${
+        source === "front_page" ? "the front page"
+      : source === "top24" ? "the last 24 hours" : "newest stories"}`
+    : "Nothing matched that filter.";
+  return titles;
 }
 
-$("today").textContent = todayStr();
-
-$("btnConnect").onclick = async ()=>{
-  if (!navigator.bluetooth){
-    log("! Web Bluetooth unavailable. Use Chrome or Edge, and open this page " +
-        "in its own tab over https or on localhost.");
-    setConn(false,"Unsupported browser");
-    return;
-  }
+async function doFetch(append){
+  const btns = [$("btnFetch"), $("btnAppend")];
+  btns.forEach(b => b.disabled = true);
   try{
-    setConn(false,"Connecting…");
-    await connect();
-    setConn(true, device.name || "Connected");
-  }catch(e){
-    log("! " + e.message);
-    setConn(false, "Connect failed");
-  }
-};
-
-$("btnStatus").onclick = async ()=>{
-  try{
-    const p = await getStatus();
-    if (!p){ log("! no status response"); return; }
-    showOffsets(p);
-    const b = await getBattery();
-    log(`battery (AB command): ${b === null ? "no response" : b + "%"}`);
-  }catch(e){ log("! " + e.message); }
-};
-
-$("btnFeed").onclick = async ()=>{
-  try{ await eject(60); log("fed ~7.5 mm"); }catch(e){ log("! " + e.message); }
-};
-
-$("btnPrint").onclick = async ()=>{
-  const btn = $("btnPrint");
-  btn.disabled = true;
-  try{
-    renderPage();
-    await printRows(canvasRows(), parseInt($("intensity").value,10));
-    await eject(48);
-  }catch(e){ log("! " + e.message); }
-  finally{ btn.disabled = false; setBtn("Print"); }
-};
-
-$("btnAdd").onclick = ()=>{ addTask().focus(); save(); renderPage(); };
-$("btnClear").onclick = ()=>{
-  document.querySelectorAll(".task").forEach(t=>{
-    if (t.querySelector("input[type=checkbox]").checked) t.remove();
-  });
-  if (!document.querySelector(".task")) addTask();
-  save(); renderPage();
-};
-for (const id of ["news","note"])
-  $(id).addEventListener("input", ()=>{ save(); renderPage(); });
-$("intensity").addEventListener("input", e=>{
-  $("intVal").textContent = "0x" + (+e.target.value).toString(16).toUpperCase();
-  save();
-});
-
-load();
-$("intVal").textContent = "0x" + (+$("intensity").value).toString(16).toUpperCase();
-setConn(false,"Not connected");
-document.fonts && document.fonts.ready.then(renderPage);
-renderPage();
-</script>
-</body>
-</html>
+    const titles = await fetchHN();
+    if (titles.length){
+      const box = $("news");
+      const existing 
