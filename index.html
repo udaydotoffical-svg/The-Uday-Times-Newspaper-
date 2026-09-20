@@ -90,6 +90,7 @@
 
 <h1>THE UDAY TIMES</h1>
 <div class="sub" id="today">—</div>
+<div class="sub" id="build" style="margin-top:-8px;font-family:var(--mono)">build 3 · feeds via rss2json</div>
 
 <div class="card">
   <h2>Printer</h2>
@@ -558,25 +559,65 @@ function parseFeed(xmlText){
   let nodes = [...doc.querySelectorAll("item > title")];
   if (!nodes.length) nodes = [...doc.querySelectorAll("entry > title")];
   return nodes.map(n => {
-    let t = (n.textContent || "").replace(/\s+/g, " ").trim();
-    // Google News appends " - Publisher"; drop it so headlines stay short.
-    t = t.replace(/\s+-\s+[^-]{2,30}$/, "");
-    return { title: t };
+    return { title: cleanTitle(n.textContent) };
   }).filter(h => h.title);
 }
 
-async function fetchFeed(url){
-  let lastErr = null;
-  for (const wrap of PROXIES){
+function decodeEntities(str){
+  const t = document.createElement("textarea");
+  t.innerHTML = str;
+  return t.value;
+}
+
+function cleanTitle(t){
+  t = decodeEntities(String(t || "")).replace(/\s+/g, " ").trim();
+  // Google News appends " - Publisher"; drop it to save paper width.
+  return t.replace(/\s+-\s+[^-]{2,30}$/, "");
+}
+
+// Attempt 1: rss2json. A free service built for exactly this: RSS in,
+// JSON out, CORS enabled, no key. Far more reliable than raw proxies.
+async function viaRss2Json(url){
+  const res = await fetch(
+    "https://api.rss2json.com/v1/api.json?rss_url=" + encodeURIComponent(url));
+  if (!res.ok) throw new Error("rss2json HTTP " + res.status);
+  const j = await res.json();
+  if (j.status !== "ok") throw new Error("rss2json: " + (j.message || j.status));
+  return (j.items || []).map(i => ({ title: cleanTitle(i.title) }))
+                        .filter(h => h.title);
+}
+
+// Attempts 2+: raw CORS proxies, parsing the XML ourselves.
+async function viaProxy(wrap, url, label){
+  const res = await fetch(wrap(url));
+  if (!res.ok) throw new Error(label + " HTTP " + res.status);
+  const text = await res.text();
+  if (!text || text.length < 50) throw new Error(label + " returned nothing");
+  return parseFeed(text);
+}
+
+async function fetchFeed(url, name){
+  const errors = [];
+  const attempts = [
+    ["rss2json", () => viaRss2Json(url)],
+    ["allorigins", () => viaProxy(PROXIES[0], url, "allorigins")],
+    ["codetabs",   () => viaProxy(PROXIES[1], url, "codetabs")],
+    ["corsproxy",  () => viaProxy(PROXIES[2], url, "corsproxy")],
+  ];
+  for (const [label, run] of attempts){
     try{
-      const res = await fetch(wrap(url));
-      if (!res.ok) throw new Error("proxy returned " + res.status);
-      const text = await res.text();
-      if (!text || text.length < 50) throw new Error("empty response");
-      return parseFeed(text);
-    }catch(e){ lastErr = e; }
+      const items = await run();
+      if (items.length){
+        log(`${name}: ${items.length} items via ${label}`);
+        return items;
+      }
+      errors.push(label + ": no items");
+    }catch(e){
+      errors.push(label + ": " + e.message);
+    }
   }
-  throw lastErr || new Error("all proxies failed");
+  log(`! ${name} failed -> ${errors.join(" | ")}`);
+  throw new Error(errors[0] || "all attempts failed");
 }
 
 function hnUrl(source, count){
@@ -587,6 +628,27 @@ function hnUrl(source, count){
   const nf = encodeURIComponent(`created_at_i>${since}`);
   return `${HN_API}search?tags=story&numericFilters=${nf}&hitsPerPage=${n}`;
 }
+
+const NEWS_DOMAINS = ["techcrunch.com", "theverge.com", "arstechnica.com",
+                      "engadget.com", "wired.com", "reuters.com"];
+
+// Stories on Hacker News whose link points at a real tech newsroom.
+// Unverified from my side (the sandbox cannot reach the API), so it is
+// only used when every RSS route has already failed.
+async function fetchHNTechNews(count){
+  const since = Math.floor(Date.now()/1000) - 172800;   // last 48h
+  const nf = encodeURIComponent("created_at_i>" + since);
+  const results = await Promise.allSettled(NEWS_DOMAINS.map(d =>
+    fetch(`${HN_API}search_by_date?tags=story&query=${encodeURIComponent(d)}` +
+          `&restrictSearchableAttributes=url&numericFilters=${nf}&hitsPerPage=6`)
+      .then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(j => (j.hits || []).filter(h => h.title && (h.url || "").includes(d))
+                               .map(h => ({ title: cleanTitle(h.title) })))));
+  const lists = results.filter(r => r.status === "fulfilled").map(r => r.value);
+  return interleave(lists);
+}
+
+let lastVia = "";
 
 async function fetchHN(){
   const source = $("hnSource").value;
@@ -600,15 +662,23 @@ async function fetchHN(){
   if (source === "mix"){
     via = "mixed tech sources";
     const results = await Promise.allSettled(
-      MIX.map(k => fetchFeed(FEEDS[k].url)));
-    const lists = results.filter(r => r.status === "fulfilled").map(r => r.value);
-    if (!lists.length) throw new Error("every source failed");
-    if (lists.length < MIX.length)
+      MIX.map(k => fetchFeed(FEEDS[k].url, FEEDS[k].name)));
+    let lists = results.filter(r => r.status === "fulfilled").map(r => r.value);
+    if (!lists.length){
+      // Last resort: tech-news links submitted to Hacker News. That API
+      // sends CORS headers, so it works when every RSS route is blocked.
+      log("all RSS routes failed, trying tech-news links on Hacker News");
+      const fallback = await fetchHNTechNews(count);
+      if (!fallback.length) throw new Error("every source failed (see log)");
+      lists = [fallback];
+      via = "tech-news links on Hacker News";
+    } else if (lists.length < MIX.length){
       log(`${lists.length}/${MIX.length} sources responded`);
+    }
     hits = interleave(lists);
   } else if (FEEDS[source]){
     via  = FEEDS[source].name;
-    hits = await fetchFeed(FEEDS[source].url);
+    hits = await fetchFeed(FEEDS[source].url, FEEDS[source].name);
   } else {
     via = source === "front_page" ? "Hacker News front page"
                                   : "Hacker News, last 24h";
@@ -625,6 +695,7 @@ async function fetchHN(){
   hits = hits.filter(h => !seen.has(h.title) && seen.add(h.title));
 
   const titles = hits.slice(0, count).map(h => h.title);
+  lastVia = via;
   $("hnStatus").textContent = titles.length
     ? `${titles.length} headline${titles.length===1?"":"s"} from ${via}`
     : "Nothing matched that filter.";
@@ -644,10 +715,10 @@ async function doFetch(append){
         : titles;
       box.value = merged.join("\n");
       save(); renderPage();
-      log(`pulled ${titles.length} headlines from Hacker News`);
+      log(`pulled ${titles.length} headlines from ${lastVia}`);
     }
   }catch(e){
-    $("hnStatus").textContent = "Fetch failed: " + e.message;
+    $("hnStatus").textContent = "Fetch failed - open the Log card below for the exact reason.";
     log("! headlines: " + e.message);
   }finally{
     btns.forEach(b => b.disabled = false);
@@ -809,6 +880,7 @@ load();
 $("intVal").textContent = "0x" + (+$("intensity").value).toString(16).toUpperCase();
 $("thrVal").textContent = $("threshold").value;
 THRESHOLD = +$("threshold").value;
+log("build 3 loaded");
 setConn(false,"Not connected");
 document.fonts && document.fonts.ready.then(renderPage);
 renderPage();
