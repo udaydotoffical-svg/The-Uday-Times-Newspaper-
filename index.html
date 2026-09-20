@@ -129,12 +129,23 @@
   <h2>Tech news</h2>
 
   <div class="row" style="align-items:flex-end">
-    <div style="flex:2 1 140px">
-      <label>Hacker News</label>
+    <div style="flex:2 1 160px">
+      <label>Source</label>
       <select id="hnSource">
-        <option value="front_page">Front page</option>
-        <option value="top24">Top, last 24h</option>
-        <option value="new">Newest stories</option>
+        <option value="mix" selected>Mixed tech (best of all)</option>
+        <optgroup label="Tech news">
+          <option value="gn_tech">Google News — Technology</option>
+          <option value="bbc_tech">BBC Technology</option>
+          <option value="techcrunch">TechCrunch</option>
+          <option value="engadget">Engadget</option>
+          <option value="ars">Ars Technica</option>
+          <option value="verge">The Verge</option>
+          <option value="toi_tech">Times of India — Tech</option>
+        </optgroup>
+        <optgroup label="Developer">
+          <option value="front_page">Hacker News — front page</option>
+          <option value="top24">Hacker News — last 24h</option>
+        </optgroup>
       </select>
     </div>
     <div style="flex:1 1 80px">
@@ -146,12 +157,13 @@
     </div>
   </div>
   <label>Only headlines containing (optional, comma separated)</label>
-  <input type="text" id="hnFilter" placeholder="esp32, linux, ai">
+  <input type="text" id="hnFilter" placeholder="esp32, chip, linux, ai">
   <div class="row" style="margin-top:8px">
     <button id="btnFetch">Fetch headlines</button>
     <button id="btnAppend">Fetch &amp; append</button>
   </div>
-  <p class="hint" id="hnStatus">Pulls from the Hacker News API. Needs internet.</p>
+  <p class="hint" id="hnStatus">Tech headlines, fetched through a public CORS
+     proxy since news sites block direct browser requests.</p>
 
   <label>One headline per line</label>
   <textarea id="news" placeholder="ESP32-S3 gains native USB host support&#10;Debian 14 freeze begins"></textarea>
@@ -505,52 +517,28 @@ function canvasRows(){
 // parse than RSS, and RSS mirrors usually block cross-origin requests).
 const HN_API = "https://hn.algolia.com/api/v1/";
 
-function hnUrl(source, count){
-  // Over-fetch so keyword filtering still leaves enough headlines.
-  const n = Math.min(count * 6, 50);
-  if (source === "front_page")
-    return `${HN_API}search?tags=front_page&hitsPerPage=${n}`;
-  if (source === "top24"){
-    const since = Math.floor(Date.now()/1000) - 86400;
-    return `${HN_API}search?tags=story&numericFilters=created_at_i>${since}` +
-           `&hitsPerPage=${n}`;
-  }
-  return `${HN_API}search_by_date?tags=story&hitsPerPage=${n}`;
-}
+// Real news comes from RSS. Browsers cannot read those feeds directly
+// (no CORS headers), so requests go through a public proxy. Several are
+// tried in turn because free proxies come and go.
+const PROXIES = [
+  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+  u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+];
 
-async function fetchHN(){
-  const source = $("hnSource").value;
-  const count  = parseInt($("hnCount").value, 10);
-  const terms  = $("hnFilter").value.toLowerCase()
-                   .split(",").map(s=>s.trim()).filter(Boolean);
+const GN = (topic) =>
+  `https://news.google.com/rss/headlines/section/topic/${topic}?hl=en-IN&gl=IN&ceid=IN:en`;
 
-  $("hnStatus").textContent = "Fetching…";
-  const res = await fetch(hnUrl(source, count));
-  if (!res.ok) throw new Error("Hacker News API returned " + res.status);
-  const data = await res.json();
+const FEEDS = {
+  gn_tech:    { name:"Google News Tech", url:GN("TECHNOLOGY") },
+  bbc_tech:   { name:"BBC Technology",   url:"https://feeds.bbci.co.uk/news/technology/rss.xml" },
+  techcrunch: { name:"TechCrunch",       url:"https://techcrunch.com/feed/" },
+  engadget:   { name:"Engadget",         url:"https://www.engadget.com/rss.xml" },
+  ars:        { name:"Ars Technica",     url:"https://feeds.arstechnica.com/arstechnica/index" },
+  verge:      { name:"The Verge",        url:"https://www.theverge.com/rss/index.xml" },
+  toi_tech:   { name:"Times of India Tech",
+                url:"https://timesofindia.indiatimes.com/rssfeeds/66949542.cms" },
+};
 
-  let hits = (data.hits || []).filter(h => h.title);
-  if (terms.length){
-    hits = hits.filter(h => terms.some(t => h.title.toLowerCase().includes(t)));
-  }
-  // Drop duplicates, keep order.
-  const seen = new Set();
-  hits = hits.filter(h => !seen.has(h.title) && seen.add(h.title));
+// "M
 
-  const titles = hits.slice(0, count).map(h => h.title.replace(/\s+/g, " ").trim());
-  $("hnStatus").textContent = titles.length
-    ? `${titles.length} headline${titles.length===1?"":"s"} from ${
-        source === "front_page" ? "the front page"
-      : source === "top24" ? "the last 24 hours" : "newest stories"}`
-    : "Nothing matched that filter.";
-  return titles;
-}
-
-async function doFetch(append){
-  const btns = [$("btnFetch"), $("btnAppend")];
-  btns.forEach(b => b.disabled = true);
-  try{
-    const titles = await fetchHN();
-    if (titles.length){
-      const box = $("news");
-      const existing 
