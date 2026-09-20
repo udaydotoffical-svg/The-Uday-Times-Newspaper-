@@ -90,7 +90,7 @@
 
 <h1>THE UDAY TIMES</h1>
 <div class="sub" id="today">—</div>
-<div class="sub" id="build" style="margin-top:-8px;font-family:var(--mono)">build 3 · feeds via rss2json</div>
+<div class="sub" id="build" style="margin-top:-8px;font-family:var(--mono)">build 5 · live tech quote</div>
 
 <div class="card">
   <h2>Printer</h2>
@@ -170,6 +170,13 @@
   <textarea id="news" placeholder="ESP32-S3 gains native USB host support&#10;Debian 14 freeze begins"></textarea>
   <label>Footer note (optional)</label>
   <input type="text" id="note" placeholder="Build the thing.">
+
+  <label style="display:flex;gap:8px;align-items:center;margin-top:12px">
+    <input type="checkbox" id="quoteOn" checked style="width:auto">
+    <span>Daily tech quote in the footer (live)</span>
+  </label>
+  <p class="hint" id="quotePreview" style="font-style:italic"></p>
+  <button id="btnQuote" style="margin-top:4px">Another quote</button>
 </div>
 
 <div class="card">
@@ -390,6 +397,14 @@ function todayStr(){
 }
 
 function renderPage(){
+  const qp = document.getElementById("quotePreview");
+  if (qp){
+    const q = activeQuote();
+    qp.textContent = QUOTE_ON
+      ? "\u201C" + q.text + "\u201D" + (q.by ? " \u2014 " + q.by : "") +
+        "  [" + q.src + "]"
+      : "Quote is off.";
+  }
   const tasks = [...document.querySelectorAll(".task")].map(t=>({
     text: t.querySelector("input[type=text]").value.trim(),
     done: t.querySelector("input[type=checkbox]").checked
@@ -433,6 +448,153 @@ function wrap(text, x, y, maxW, lh){
   }
   if (cur){ ctx.fillText(cur, x, y); y += lh; }
   return y;
+}
+
+/* ===================== daily quote ===================== */
+
+// Built-in general tech quotes. Used when no live source answers, so the
+// footer never comes out empty. One per day, picked by date.
+const QUOTES = [
+  { text:"Any sufficiently advanced technology is indistinguishable from magic.", by:"Arthur C. Clarke" },
+  { text:"The best way to predict the future is to invent it.", by:"Alan Kay" },
+  { text:"Technology is a useful servant but a dangerous master.", by:"Christian Lous Lange" },
+  { text:"The real problem is not whether machines think but whether men do.", by:"B. F. Skinner" },
+  { text:"Design is not just what it looks like and feels like. Design is how it works.", by:"Steve Jobs" },
+  { text:"The Web as I envisaged it, we have not seen it yet. The future is still so much bigger than the past.", by:"Tim Berners-Lee" },
+  { text:"Software is eating the world.", by:"Marc Andreessen" },
+  { text:"The science of today is the technology of tomorrow.", by:"Edward Teller" },
+  { text:"We are stuck with technology when what we really want is just stuff that works.", by:"Douglas Adams" },
+  { text:"A computer is like a bicycle for our minds.", by:"Steve Jobs" },
+  { text:"Man is a tool-using animal.", by:"Thomas Carlyle" },
+  { text:"We can only see a short distance ahead, but we can see plenty there that needs to be done.", by:"Alan Turing" },
+  { text:"Genius is one percent inspiration, ninety-nine percent perspiration.", by:"Thomas Edison" },
+  { text:"Stay hungry. Stay foolish.", by:"Steve Jobs" },
+  { text:"The only way to do great work is to love what you do.", by:"Steve Jobs" },
+  { text:"That's one small step for man, one giant leap for mankind.", by:"Neil Armstrong" },
+  { text:"We choose to go to the Moon in this decade and do the other things, not because they are easy, but because they are hard.", by:"John F. Kennedy" },
+  { text:"The Internet is the first thing that humanity has built that humanity doesn't understand.", by:"Eric Schmidt" },
+  { text:"The good thing about science is that it's true whether or not you believe in it.", by:"Neil deGrasse Tyson" },
+  { text:"Move fast and break things.", by:"Mark Zuckerberg" },
+  { text:"Science and technology revolutionize our lives, but memory, tradition and myth frame our response.", by:"Arthur Schlesinger Jr." },
+  { text:"An invention has to make sense in the world in which it finishes, not in the world in which it starts.", by:"Ray Kurzweil" },
+  { text:"Machines take me by surprise with great frequency.", by:"Alan Turing" },
+  { text:"The question of whether a computer can think is no more interesting than the question of whether a submarine can swim.", by:"Edsger Dijkstra" },
+  { text:"Never trust a computer you can't throw out a window.", by:"Steve Wozniak" },
+  { text:"Technology is best when it brings people together.", by:"Matt Mullenweg" },
+  { text:"Perfection is achieved, not when there is nothing more to add, but when there is nothing left to take away.", by:"Antoine de Saint-Exup\u00e9ry" },
+  { text:"The most dangerous phrase in the language is, \"We've always done it this way.\"", by:"Grace Hopper" },
+  { text:"The Internet is becoming the town square for the global village of tomorrow.", by:"Bill Gates" },
+  { text:"Talk is cheap. Show me the code.", by:"Linus Torvalds" },
+  { text:"Testing shows the presence, not the absence of bugs.", by:"Edsger Dijkstra" },
+];
+
+let QUOTE_ON = true;
+let quoteOffset = 0;      // built-in list only: nudged when live sources fail
+let currentQuote = null;  // {text, by, src} from a live source, else null
+const QUOTE_MAX = 160;    // characters; keeps the footer to about four lines
+
+// Whole days since the epoch, counted in LOCAL time so it flips at midnight.
+function dayNumber(){
+  const d = new Date();
+  return Math.floor(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) / 86400000);
+}
+
+function builtInQuote(){
+  const q = QUOTES[(dayNumber() + quoteOffset) % QUOTES.length];
+  return { text:q.text, by:q.by, src:"built-in list" };
+}
+function activeQuote(){ return currentQuote || builtInQuote(); }
+
+async function fetchJSON(url, ms){
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms || 6000);
+  try{
+    const res = await fetch(url, { signal: ctl.signal });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return await res.json();
+  }catch(e){
+    throw new Error(e.name === "AbortError" ? "timed out" : e.message);
+  }finally{ clearTimeout(timer); }
+}
+
+// Live sources, tried in order. Both are asked for the *technology* tag or
+// genre. Free quote APIs come and go (Quotable in particular has had
+// repeated outages), so a failure here is normal and just moves on.
+const QUOTE_SOURCES = [
+  { name:"Quotable",
+    run: async () => {
+      const j = await fetchJSON(
+        "https://api.quotable.io/quotes/random?tags=technology&maxLength=" + QUOTE_MAX);
+      const q = Array.isArray(j) ? j[0] : j;
+      if (!q || !q.content) throw new Error("no technology quote returned");
+      return { text:q.content, by:q.author };
+    } },
+  { name:"Quote Garden",
+    run: async () => {
+      // Hosted on a free tier that can take a while to wake up.
+      const j = await fetchJSON(
+        "https://quote-garden.onrender.com/api/v3/quotes/random?genre=technology", 10000);
+      const q = j && j.data && j.data[0];
+      if (!q || !q.quoteText) throw new Error("no technology quote returned");
+      return { text:q.quoteText, by:q.quoteAuthor };
+    } },
+];
+
+function cleanQuoteText(t){
+  t = decodeEntities(String(t || "")).replace(/\s+/g, " ").trim();
+  return t.replace(/^[\u201C"']+|[\u201D"']+$/g, "").trim();
+}
+
+async function fetchLiveQuote(){
+  const errors = [];
+  for (const src of QUOTE_SOURCES){
+    for (let attempt = 0; attempt < 2; attempt++){
+      try{
+        const q = await src.run();
+        const text = cleanQuoteText(q.text);
+        if (!text) throw new Error("empty quote");
+        if (text.length > QUOTE_MAX) throw new Error("too long for the paper");
+        let by = String(q.by || "").trim();
+        if (/^unknown$/i.test(by)) by = "";
+        return { text, by, src:src.name };
+      }catch(e){
+        errors.push(src.name + ": " + e.message);
+        // Only a too-long quote is worth re-rolling on the same source.
+        if (e.message !== "too long for the paper") break;
+      }
+    }
+  }
+  log("! live quote failed -> " + errors.join(" | "));
+  return null;
+}
+
+// force=false: reuse today's saved quote if there is one (one API call per
+// day). force=true: "Another quote" -- always ask for a fresh one.
+async function loadDailyQuote(force){
+  const day = dayNumber();
+  if (!force){
+    try{
+      const c = JSON.parse(localStorage.getItem("udayTimesQuote") || "null");
+      if (c && c.day === day && c.text){
+        currentQuote = { text:c.text, by:c.by, src:c.src };
+        renderPage();
+        return;
+      }
+    }catch(e){}
+  }
+  const q = await fetchLiveQuote();
+  if (q){
+    currentQuote = q;
+    try{ localStorage.setItem("udayTimesQuote", JSON.stringify({ day, ...q })); }catch(e){}
+    log("quote via " + q.src);
+  } else if (force){
+    currentQuote = null;
+    quoteOffset++;                 // no live source: shuffle the built-in list
+    log("live sources unreachable, using the built-in list");
+  } else {
+    currentQuote = null;           // keep today's built-in pick
+  }
+  renderPage();
 }
 
 // Draws the page; returns final y. Used for both measuring and drawing.
@@ -479,6 +641,20 @@ function draw(tasks, news, note){
     y = wrap(note, WIDTH/2, y, WIDTH-40, 18);
     ctx.textAlign = "left";
     y += 6;
+  }
+
+  if (QUOTE_ON){
+    const q = activeQuote();
+    if (note) y = line(y, true);        // separate it from a typed note
+    y += 2;
+    ctx.textAlign = "center";
+    ctx.font = "italic 13px Georgia, 'Times New Roman', serif";
+    y = wrap("\u201C" + q.text + "\u201D", WIDTH/2, y, WIDTH-44, 16);
+    if (q.by){
+      ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
+      ctx.fillText("\u2014 " + q.by, WIDTH/2, y); y += 15;
+    }
+    ctx.textAlign = "left";
   }
   return y + 12;
 }
@@ -764,7 +940,8 @@ function save(){
       intensity:$("intensity").value, threshold:$("threshold").value,
       shortFeed:$("shortFeed").checked, flip:$("flip").checked,
       hnSource:$("hnSource").value, hnCount:$("hnCount").value,
-      hnFilter:$("hnFilter").value }));
+      hnFilter:$("hnFilter").value,
+      quoteOn:$("quoteOn").checked, quoteOffset, quoteDay:dayNumber() }));
   }catch(e){}
 }
 
@@ -780,6 +957,9 @@ function load(){
     if (d.hnSource) $("hnSource").value = d.hnSource;
     if (d.hnCount)  $("hnCount").value  = d.hnCount;
     if (d.hnFilter) $("hnFilter").value = d.hnFilter;
+    if (d.quoteOn !== undefined){ $("quoteOn").checked = d.quoteOn; QUOTE_ON = d.quoteOn; }
+    // Keep a shuffled pick only for the day it was made.
+    if (d.quoteDay === dayNumber() && d.quoteOffset) quoteOffset = d.quoteOffset;
     if (d.flip !== undefined){ $("flip").checked = d.flip; ROTATE180 = d.flip; }
     if (d.shortFeed !== undefined){
       $("shortFeed").checked = d.shortFeed;
@@ -876,14 +1056,26 @@ $("intensity").addEventListener("input", e=>{
   save();
 });
 
+$("quoteOn").addEventListener("change", e=>{
+  QUOTE_ON = e.target.checked; save(); renderPage();
+});
+$("btnQuote").onclick = async ()=>{
+  const b = $("btnQuote");
+  b.disabled = true; b.textContent = "Fetching\u2026";
+  QUOTE_ON = true; $("quoteOn").checked = true;
+  try{ await loadDailyQuote(true); }
+  finally{ b.disabled = false; b.textContent = "Another quote"; save(); }
+};
+
 load();
 $("intVal").textContent = "0x" + (+$("intensity").value).toString(16).toUpperCase();
 $("thrVal").textContent = $("threshold").value;
 THRESHOLD = +$("threshold").value;
-log("build 3 loaded");
+log("build 5 loaded");
 setConn(false,"Not connected");
 document.fonts && document.fonts.ready.then(renderPage);
 renderPage();
+loadDailyQuote(false);   // live tech quote, cached for the day
 </script>
 </body>
 </html>
